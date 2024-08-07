@@ -28,11 +28,13 @@
 
   export let accounts: Array<string> = [];
 
+  export let chainid: number = 1;
+
   export let config: Config = {
     // Required fields
     projectId: "",
     showQrModal: true,
-    chains: [1],
+    chains: [chainid],
   };
 
   let loading = false;
@@ -65,7 +67,7 @@
   }
 
   // FIXME: The call flow to here is janky, need to refactor
-  export async function connect(force: "walletconnect"|"injected"|"safe"|"any", provider?: any, account?: string) {
+  export async function connect(force?: "walletconnect"|"injected"|"safe"|"any", provider?: any, account?: string) {
     if (force === "safe") {
       accounts = account ? [account] : [];
       dispatch("connect", { provider: provider, accounts });

@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import { page } from '$app/stores';
+  import { pushState } from '$app/navigation';
   import { ethers } from "ethers";
   import { whatsabi, loaders } from "@shazow/whatsabi";
   import ConnectWallet from '$lib/ConnectWallet.svelte';
+  import NetworkSelector from '$lib/NetworkSelector.svelte';
   import Address from '$lib/contract/Address.svelte';
   import Summary from '$lib/contract/Summary.svelte';
   import Value from '$lib/contract/Value.svelte';
@@ -18,22 +19,53 @@
   }
 
   export let config : Config;
-  export let calldata : string;
   export let args : Record<string, string[]>;
-  export let value : string;
-  export let to : string;
-  export let editing : boolean = (to === "");
-  export let hint : string;
+  let calldata : string = "";
+  let value : string = "";
+  let to : string = "";
+  let editing : boolean = (to === "");
+  let hint : string = "";
+  let chainid : number = 1;
+
+  let resetKey = {};
+
+  export async function load(params: {calldata: string, value: string, to: string, hint: string, chainid: number}) {
+    calldata = params.calldata;
+    value = params.value;
+    to = params.to;
+    hint = params.hint;
+    editing = (to === "");
+    loading = {};
+
+    if (chainid !== params.chainid) {
+      await switchNetwork(params.chainid);
+      chainid = params.chainid;
+    }
+
+    if (calldata.length >= 10 && hint) {
+      await loadHint(hint);
+    }
+    if (calldata.length <= 2) { // 0x
+      selectedFunction = "";
+      selectedFragment = undefined;
+      functionArgs = [];
+      functions = [];
+      preparedTx = null;
+    }
+    if (!to) {
+      toResolved = "";
+      resetKey = {}; // Nuke Address element and reinit
+      result = null;
+    }
+  }
 
   let from : string;
   let toResolved : string;
-  let toMethods : {
-    resolve(target:any): Promise<string>,
-  };
-  let connectMethods : {
-    connect(): Promise<void>;
-    disconnect: null|(() => void),
-  };
+
+  let toAddressComponent : Address;
+  let connectWalletComponent : ConnectWallet;
+  let networkSelectorComponent : NetworkSelector;
+
   const defaultProvider = ethers.getDefaultProvider("homestead");
   let provider : ethers.Provider = defaultProvider;
   let signer : ethers.Signer | undefined = undefined;
@@ -50,7 +82,7 @@
   let network : {
     chainId: bigint,
     name: string,
-  };
+  } | null = null;
   let loading : Record<string, boolean> = {};
 
   const abiLoader = new loaders.MultiABILoader([
@@ -61,23 +93,20 @@
     }),
   ]);
 
-  onMount(async () => {
-    // Load hint?
-    if (calldata.length >= 10 && hint) {
-      const maybeABI = ethers.Interface.from(["function " + hint]);
-      const fn = maybeABI.getFunction(calldata.slice(0, 10));
-      if (!fn) return;
-   
-      selectedFunction = fn.selector;
-      abi = maybeABI;
-      functions = [fn];
-      updateFunction();
-      log.info('Loaded partial ABI from hint');
-    }
+  async function loadHint(hint: string) {
+    const maybeABI = ethers.Interface.from(["function " + hint]);
+    const fn = maybeABI.getFunction(calldata.slice(0, 10));
+    if (!fn) return;
 
-    if (provider) await toMethods.resolve("mount");
+    selectedFunction = fn.selector;
+    abi = maybeABI;
+    functions = [fn];
+    updateFunction();
+    log.info('Loaded partial ABI from hint');
+
+    if (provider) await toAddressComponent.resolve("mount");
     else if (to) await loadAddress();
-  });
+  }
 
   const log = {
     error(err: Error|string) {
@@ -102,6 +131,18 @@
     return Promise.resolve(r);
   };
 
+  function prepareTransaction(from: string, to: string, calldata: string, value: string): PreparedTransaction {
+    const tx : PreparedTransaction = {
+      from: from,
+      to: to,
+      data: null,
+      value: null,
+    };
+    if (calldata) tx.data = calldata;
+    if (value && value !== "0") tx.value = ethers.parseEther(value);
+    return tx;
+  }
+
   async function handleSubmit() {
     if (loading.submit) {
       log.info("Already submitting, ignored new submit");
@@ -109,7 +150,7 @@
     }
     result = null;
     preparedTx = null;
-    log.info("Submitting preview transaction", { from, toResolved, calldata, value });
+    log.info("Submitting preview transaction", { from, toResolved, calldata, value, provider });
 
     if (!provider) {
       return log.error("Ethereum provider not available");
@@ -117,40 +158,40 @@
 
     if (!toResolved) {
       log.info("Transaction 'to' field is not resolved");
-      await toMethods.resolve("submit");
+      toResolved = await toAddressComponent.resolve("submit");
     }
 
-    const tx : PreparedTransaction = {
-      from: from,
-      to: toResolved,
-      data: null,
-      value: null,
-    };
-    if (calldata) tx.data = calldata;
-    if (value && value !== "0") tx.value = ethers.parseEther(value);
-
+    const tx = prepareTransaction(from, toResolved || to, calldata, value);
     if (!tx.to) {
       // TODO: We can remove this check once ethers.js v6 bug is fixed?
       return log.error("Failed resolving 'to' address");
     }
 
     loading.submit = true;
+    let stale = false;
     try {
-      let r = await provider.call(tx);
+      const r = await provider.call(tx);
+      result = {
+        status: "ok",
+      };
       if (selectedFragment && selectedFragment.outputs?.length > 0) {
         // TODO: Use this function once its implemented: abi.parseCallResult(r)
         const res = abi.decodeFunctionResult(selectedFragment, r);
-        r = res.toString();
-      }
-      result = {
-        status: "ok",
-        value: r,
+        result.value = res.toString();
       }
       log.info("Loaded result", result);
+
+      const currentTx = prepareTransaction(from, toResolved || to, calldata, value);
+      stale = tx.to !== currentTx.to && tx.data !== currentTx.data && tx.value !== currentTx.value;
+      if (stale) {
+        log.info("Removed stale result:", result);
+        result = null;
+      }
     } catch(err) {
       return log.error(err as Error);
     } finally {
       loading.submit = false;
+      if (stale) return;
       const mutability = selectedFragment?.stateMutability;
       if (mutability !== "view" && mutability != "pure") {
         preparedTx = tx;
@@ -184,7 +225,9 @@
   }
 
   async function loadAddress(event?: CustomEvent) {
-    if (!provider) {
+    result = null;
+
+    if (!provider || !to) {
       return;
     }
     if (event) toResolved = event.detail.resolved;
@@ -198,6 +241,10 @@
         abiLoader,
         followProxies: true,
         onProgress: (progress, ...args: any[]) => log.info("WhatsABI:", progress, args),
+        addressResolver: resolver,
+        ... whatsabi.loaders.defaultsWithEnv({
+          SOURCIFY_CHAIN_ID: chainid,
+        }),
       });
     } finally {
       loading.to = false;
@@ -210,7 +257,11 @@
       abi = ethers.Interface.from(r.abi);
       functions = [];
       abi.forEachFunction(f => functions.push(f));
+    } else if (r.abi.length === 0) {
+      functions = [];
+      abi = ethers.Interface.from([]);
     }
+
     updateFunction();
   }
 
@@ -229,20 +280,46 @@
     }
   }
 
+  async function switchNetwork(chainid: number) {
+    if (!signer) {
+      return networkSelectorComponent.change(chainid);
+    }
+    const browserProvider = provider as ethers.BrowserProvider;
+    const params = [{ "chainId": "0x" + chainid.toString(16) }];
+    try {
+      await browserProvider.send("wallet_switchEthereumChain", params);
+    } catch (error) {
+      if ((error as Error).message.includes("Unrecognized chain ID")) {
+        log.error(`Requested to switch to chainId ${chainid}, but wallet is not aware of it. Use chainlist.org to add chain details first.`);
+      }
+      return
+    }
+
+    connect({ provider: browserProvider, accounts: [from] });
+  }
+
   async function connect(wallet: { provider: any, accounts: string[] }) {
     const browserProvider = new ethers.BrowserProvider(wallet.provider);
+    network = await browserProvider.getNetwork();
+
+    if (chainid !== Number(network.chainId)) {
+      await switchNetwork(chainid);
+      return connect(wallet);
+    }
+
     provider = browserProvider;
     signer = await browserProvider.getSigner();
     from = wallet.accounts[0];
-    network = await provider.getNetwork();
+
     log.info(`Connected wallet: ${from}`);
-    if (to) toMethods.resolve("connect");
+    if (to) toAddressComponent.resolve("connect");
   }
 
   async function disconnect() {
     log.info("Wallet disconnected");
     provider = defaultProvider;
     signer = undefined;
+    network = null;
   }
 
   function updateLink() {
@@ -257,6 +334,7 @@
       value: value,
       hint: selectedFragment?.format("sighash"),
     }
+    if (chainid > 1) state.chainid = chainid.toString();
 
     // Clear unset keys
     for (const key of $page.url.searchParams.keys()) {
@@ -270,9 +348,33 @@
       $page.url.searchParams.set(k, v);
     }
 
-    // TODO: Subscribe to history changes
-    window.history.pushState({}, "link", $page.url);
+    pushState($page.url, state);
     editing = false;
+  }
+
+  function onNetworkChanged(event: CustomEvent) {
+    const n = event.detail.network;
+    if (n === undefined) {
+      return connectWalletComponent.methods.connect("any");
+    }
+    if (signer) {
+      return switchNetwork(n.chainid);
+    }
+
+    // Fallback provider composed of all the network.rpc[] endpoints
+    provider = new ethers.FallbackProvider(
+      n.rpc.map((url: string) => {
+        return new ethers.JsonRpcProvider(url)
+      })
+    );
+    chainid = n.chainid;
+    provider.getNetwork().then(n => {
+      network = n;
+    })
+
+    log.info(`Network changed to ${n.name}`, n, provider);
+
+    loadAddress();
   }
 
   function onInputsChanged(event: CustomEvent) {
@@ -316,14 +418,21 @@
 
 <form bind:this={form} on:submit|preventDefault="{handleSubmit}" class="builder">
   <section>
+    <h2>Network</h2>
+    <NetworkSelector bind:this={networkSelectorComponent} selected={chainid} on:change={ onNetworkChanged } />
+  </section>
+
+  <section>
     <h2>From</h2>
-    <ConnectWallet bind:methods={connectMethods} config={ config } on:connect={ (e) => connect(e.detail) } on:disconnect={ disconnect }>
+    <ConnectWallet bind:this={connectWalletComponent} chainid={ chainid } config={ config } on:connect={ (e) => connect(e.detail) } on:disconnect={ disconnect }>
       <svelte:fragment slot="connected-label">{ network?.name || "Connected" }</svelte:fragment>
     </ConnectWallet>
   </section>
 
   <section>
-    <Address required disabled={ !editing } bind:methods={ toMethods } resolver={ resolver } bind:value={ to } on:change={ loadAddress }><h2>To</h2></Address>
+    {#key resetKey}
+    <Address required disabled={ !editing } bind:this={ toAddressComponent } resolver={ resolver } bind:value={ to } on:change={ loadAddress }><h2>To</h2></Address>
+    {/key}
   </section>
 
   {#if loading.to}
@@ -414,10 +523,12 @@
   {/if}
 
   {#if preparedTx}
+  <hr />
+
   <section>
     <h2>Execute On-chain</h2>
     {#if !signer}
-    <button class="icon-connect" on:click|preventDefault={ connectMethods.connect } >Connect Wallet</button>
+    <button class="icon-connect" on:click|preventDefault={ _ => connectWalletComponent.methods.connect("any") } >Connect Wallet</button>
     {/if}
     <button on:click|preventDefault={ submitTransaction } disabled={ !signer || loading.submit }>🚀 Submit Transaction</button>
     {#if signer}
@@ -430,10 +541,15 @@
 
 {#if !to}
 <section class="example">
-  <h3>Build a transaction, get a link:</h3>
+  <h3>Callthis is a transaction builder...</h3>
   <ul>
-    <li>🥹 Example: <a href="/?to=callthis.eth&value=0.1">Send 0.1 ETH to <code>callthis.eth</code></a></li>
-    <li>💰 Example: <a href="/?data=0x70a08231000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045&to=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48&hint=balanceOf%28address%29">Call <code>USDC.balanceOf(vitalik.eth)</code></a></li>
+    <li><strong>Generate an interface for any contract</strong>, even if it's unverified. (Powered by <a target="_blank" href="https://github.com/shazow/whatsabi">WhatsABI</a>)</li>
+    <li>Build a transaction and save it as a link that can be shared and executed later. (Example: <a href="/?to=callthis.eth&value=0.1">Send 0.1 ETH to <code>callthis.eth</code></a>)</li>
+    <li><strong>Works with any EVM chain</strong>, with WalletConnect or Safe Wallets or browser-injected providers.</li>
+    <li>Address fields automatically resolved with ENS.</li>
+    <li>Supports complex contract inputs with tuples, arrays, etc.</li>
+    <li>No backend services required, <a href="https://github.com/shazow/callthis">grab the source</a> and <strong>run it locally for privacy and censorship-resistance</strong>!</li>
+    <li>Permissively licensed under MIT, use it in your products.</li>
   </ul>
 </section>
 {/if}
@@ -480,5 +596,10 @@
     color: rgb(200, 150, 50);
     text-align: center;
     width: 100%;
+  }
+
+  hr {
+    margin: 2.5em auto;
+    width: 20%;
   }
 </style>
